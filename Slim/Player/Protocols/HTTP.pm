@@ -328,12 +328,9 @@ sub parseDirectHeaders {
 	my ( $self, $client, $url, @headers ) = @_;
 
 	my $isDebug = main::DEBUGLOG && $directlog->is_debug;
-	my $oggType;
-	
+
 	# May get a track object
 	if ( blessed($url) ) {
-		($oggType) = $url->content_type =~ /(ogf|ogg|ops)/;
-
 		$url = $url->url;
 	}
 
@@ -435,7 +432,7 @@ sub parseDirectHeaders {
 		$contentType = 'mp3';
 	}
 
-	return ($title, $bitrate, $metaint, $redir, $oggType || $contentType, $length, $body);
+	return ($title, $bitrate, $metaint, $redir, $contentType, $length, $body);
 }
 
 =head2 parseHeaders( @headers )
@@ -453,10 +450,11 @@ sub parseHeaders {
 	my $self    = shift;
 	my $url     = $self->url;
 	my $client  = $self->client;
+	my $isOgf   = Slim::Music::Info::contentType( $url ) eq 'ogf';
 
 	my ($title, $bitrate, $metaint, $redir, $contentType, $length, $body) = $self->parseDirectHeaders($client, $url, @_);
 
-	if ($contentType) {
+	if ($contentType && !$isOgf) {
 		if (($contentType =~ /text/i) && !($contentType =~ /text\/xml/i)) {
 			# webservers often lie about playlists.  This will
 			# make it guess from the suffix.  (unless text/xml)
@@ -485,7 +483,7 @@ sub parseHeaders {
 		}
 	}
 
-	if ($bitrate) {
+	if ($bitrate && !$isOgf) {
 		main::INFOLOG && $log->is_info &&
 				$log->info(sprintf("Bitrate for %s set to %d",
 					$self->infoUrl,
