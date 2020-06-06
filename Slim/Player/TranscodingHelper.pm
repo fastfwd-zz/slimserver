@@ -123,6 +123,7 @@ sub loadConversionTables {
 # I - can transcode from stdin
 # F - can transcode from a named file
 # R - can transcode from a remote URL (URL types unspecified)
+# H - request to strip out header (wav/aif only)
 #
 # O - can seek to a byte offset in the source stream (not yet implemented)
 # T - can seek to a start time offset
@@ -393,12 +394,13 @@ sub getConvertCommand2 {
 				next PROFILE;
 		}
 
+		my $streamformat = (split (/-/, $profile))[1];
 		$transcoder = {
 			command          => $command,
 			profile          => $profile,
 			usedCapabilities => [@$need, @$want],
 			streamMode       => $streamMode,
-			streamformat     => (split (/-/, $profile))[1],
+			streamformat     => $streamformat,
 			rateLimit        => $rateLimit || 320,
 			samplerateLimit  => $samplerateLimit || 44100,
 			clientid         => $clientid || 'undefined',
@@ -407,6 +409,7 @@ sub getConvertCommand2 {
 			player           => $player || 'undefined',
 			channels         => $track->channels() || 2,
 			outputChannels   => $clientprefs ? ($clientprefs->get('outputChannels') || 2) : 2,
+			stripHeader	 	 => $type =~ /(wav|aif)/ && (($streamformat eq 'pcm' && $command eq "-") || $caps->{'H'}),
 		};
 		
 		# Check for optional profiles

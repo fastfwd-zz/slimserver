@@ -444,11 +444,33 @@ sub open {
 			rateLimit => 0,
 		};
 	}
-
+	
+	if ($transcoder->{'stripHeader'}) {
+		# Set initialAudioBlock (header to be repeated for files) to 0 (not undef)
+		$self->initialAudioBlock(0);
+		
+		# Create a seekdata to strip header. It will force a Range for HTTP and for File, it will 
+		# look like a user-seek with empty initialAudioBlock, so in practise it justs bypass header
+		# If seekdata already exist, for files, it's a user-seek but as sourceStreamOffset includes
+		# the header's offset, then zero'd initialAudioBlock just makes sure we don't stash it
+		# If we want to add seekdata for remote files as well, we need to take that into account
+		if (!$self->seekdata) {
+			my $seekdata = { 
+				'sourceStreamOffset' => $track->audio_offset || 0,
+				'sourceStreamLength' => $track->audio_size,
+			};
+			$self->seekdata( $seekdata );
+			main::INFOLOG && $log->info( "stripping header of $seekdata->{sourceStreamOffset} / $seekdata->{sourceStreamLength}");
+		} else 	{
+			main::INFOLOG && $log->info( "stripping header but seekdata already set");
+		}
+	}
+	
 	# TODO work this out for each player in the sync-group
 	my $directUrl;
 	# Make sure for direct mode that if transcode rule is identity, codec is _really_ supported (e.g. wav vs pcm)
-	if ($transcoder->{'command'} eq '-' && ($directUrl = $client->canDirectStream($url, $self)) && grep {$_ eq $format} Slim::Player::CapabilitiesHelper::supportedFormats($client)) {
+	if ($transcoder->{'command'} eq '-' && ($directUrl = $client->canDirectStream($url, $self)) && 
+		grep {$_ eq $format} Slim::Player::CapabilitiesHelper::supportedFormats($client)) {
 		main::INFOLOG && $log->info( "URL supports direct streaming [$url->$directUrl]" );
 		$self->directstream(1);
 		$self->streamUrl($directUrl);
@@ -457,7 +479,7 @@ sub open {
 	else {
 		my $handlerWillTranscode = $transcoder->{'command'} ne '-'
 			&& $handler->can('canHandleTranscode') && $handler->canHandleTranscode($self);
-
+		
 		if ($transcoder->{'streamMode'} eq 'I' || $handlerWillTranscode) {
 			main::INFOLOG && $log->info("Opening stream (no direct streaming) using $handler [$url]");
 

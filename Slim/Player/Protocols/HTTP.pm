@@ -592,8 +592,8 @@ sub requestString {
 
 	# If seeking, add Range header
 	if ($client && $seekdata) {
-		$request .= $CRLF . 'Range: bytes=' . int( ($seekdata->{sourceStreamOffset} || 0) + ($seekdata->{restartOffset} || 0) ) . '-';
-
+		$request .= $CRLF . 'Range: bytes=' . int( ($seekdata->{sourceStreamOffset} || 0) + ($seekdata->{restartOffset} || 0) ) . '-' . 
+					($seekdata->{sourceStreamLength} ? $seekdata->{sourceStreamOffset} + $seekdata->{sourceStreamLength} - 1 : '');
 		if (defined $seekdata->{timeOffset}) {
 			# Fix progress bar
 			$client->playingSong()->startOffset($seekdata->{timeOffset});
@@ -793,7 +793,7 @@ sub canSeek {
 	my $bitrate = $song->bitrate();
 	my $seconds = $song->duration();
 
-	if ( !$bitrate || !$seconds || $song->streamformat =~ /(pcm|wav|aif)/ ) {
+	if ( !$bitrate || !$seconds || $song->track->audio_offset ) {
 		#$log->debug( "bitrate: $bitrate, duration: $seconds" );
 		#$log->debug( "Unknown bitrate or duration, seek disabled" );
 		return 0;
