@@ -38,6 +38,7 @@ my @allAttributes = (qw(
 	
 	title titlesort titlesearch album tracknum
 	timestamp filesize disc audio audio_size audio_offset year
+	header_stash build_header dynamic_header audio_process
 	cover vbr_scale samplerate samplesize channels block_alignment endian
 	bpm tagversion drm musicmagic_mixable
 	musicbrainz_id lossless lyrics replay_gain replay_peak extid

@@ -89,6 +89,12 @@ sub loadConversionTables {
 				my $clientid   = lc($4);
 				my $profile = "$inputtype-$outputtype-$clienttype-$clientid";
 
+				# if profile is duplicated, find the highest index to create a unique instance
+				if ($commandTable{$profile}) {
+					my @index = sort grep { $_ =~ /\Q$profile\E/ } keys %commandTable;
+					$profile .= '-' . (($index[-1] =~ /-(\d+$)/)[0] + 1);
+				}
+				
 				$line = <CONVERT>;
 				if ($line =~ /^\s+#\s+(\S.*)/) {
 					_getCapabilities($profile, $1);
@@ -123,6 +129,7 @@ sub loadConversionTables {
 # I - can transcode from stdin
 # F - can transcode from a named file
 # R - can transcode from a remote URL (URL types unspecified)
+# H - request to strip out header (wav/aif only)
 #
 # O - can seek to a byte offset in the source stream (not yet implemented)
 # T - can seek to a start time offset
@@ -354,7 +361,13 @@ sub getConvertCommand2 {
 	}
 	
 	# Test each profile in turn
-	PROFILE: foreach my $profile (@profiles) {
+	PROFILE: foreach (@profiles) {
+		my $instance = 0;
+	INSTANCE:
+		my $profile = $instance ? "$_-$instance" : $_;
+		$instance++;
+		next PROFILE unless exists $commandTable{$profile}; 
+		
 		my $command = checkBin($profile);
 		next PROFILE if !$command;
 
@@ -372,7 +385,7 @@ sub getConvertCommand2 {
 			main::DEBUGLOG && $log->is_debug
 				&& $log->debug("Rejecting $command because no available stream mode supported: ",
 							(join(',', @$streamModes)));
-			next PROFILE;
+			goto INSTANCE;
 		}
 		
 		# Check for mandatory capabilities
@@ -383,22 +396,24 @@ sub getConvertCommand2 {
 				if ($_ eq 'D') {
 					$error ||= 'UNSUPPORTED_SAMPLE_RATE';
 				}
-				next PROFILE;
+				goto INSTANCE;
 			}
 		}
 
 		# We can't handle WMA Lossless in firmware.
 		if ($command eq "-"
 			&& $type eq 'wma' && blessed($track) && $track->lossless) {
-				next PROFILE;
+				goto INSTANCE
 		}
-
+		
+		my $streamformat = (split (/-/, $profile))[1];
+		
 		$transcoder = {
 			command          => $command,
 			profile          => $profile,
 			usedCapabilities => [@$need, @$want],
 			streamMode       => $streamMode,
-			streamformat     => (split (/-/, $profile))[1],
+			streamformat     => $streamformat,
 			rateLimit        => $rateLimit || 320,
 			samplerateLimit  => $samplerateLimit || 44100,
 			clientid         => $clientid || 'undefined',
@@ -407,8 +422,14 @@ sub getConvertCommand2 {
 			player           => $player || 'undefined',
 			channels         => $track->channels() || 2,
 			outputChannels   => $clientprefs ? ($clientprefs->get('outputChannels') || 2) : 2,
-		};
-		
+			# aif/wav oddity (for '-' rule)
+			# aif - aif: any SB that does not support wav requires aif header stripping
+			# wav/aif - pcm: force header stripping
+			stripHeader      => $caps->{'H'} || ($command eq "-" &&
+		                        (($type =~ /(wav|aif)/ && $streamformat eq 'pcm') ||
+		                         ($type eq 'aif' && $streamformat eq 'aif' && !grep {$_ eq 'wav'} @supportedformats))),
+		};					
+						 
 		# Check for optional profiles
 		my $wanted = 0;
 		my @got = ();
@@ -428,7 +449,7 @@ sub getConvertCommand2 {
 				$backupTranscoder->{'wanted'} = $wanted;
 				$backupTranscoder->{'usedCapabilities'} = [@$need, @got];
 			}
-			next PROFILE;
+			goto INSTANCE;
 		}
 		
 		last;

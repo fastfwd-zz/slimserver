@@ -164,6 +164,8 @@ sub _doTagMapping {
 	}
 }
 
+sub volatileInitialAudioBlock { 1 }
+
 sub getInitialAudioBlock {
 	my ($class, $fh, $track, $time) = @_;
 	

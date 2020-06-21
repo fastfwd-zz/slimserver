@@ -436,9 +436,19 @@ sub readRemoteHeaders {
 			main::DEBUGLOG && $log->is_debug && $log->debug('Reading AIF header');
 
 			$http->read_body( {
-				readLimit   => 4*1024,
+				readLimit   => 32*1024,
 				onBody      => \&parseAifHeader,
 				passthrough => [ $track, $args ],
+			} );
+		}
+		elsif ( $type eq 'mp4' ) {
+
+			# Read the header and optionally seek across file
+			main::DEBUGLOG && $log->is_debug && $log->debug('Reading MP4 header');
+
+			$http->read_body( {
+				onStream      => \&parseMp4Header,
+				passthrough => [ $track, $args, $url ],
 			} );
 		}
 		else {
@@ -692,6 +702,7 @@ sub parseAACHeader {
 	my $aac = Audio::Scan->scan_fh( aac => $fh );
 
 	if ( my $samplerate = $aac->{info}->{samplerate} ) {
+		# TODO: should this be removed?
 		if ( $samplerate <= 24000 ) { # XXX remove when Audio::Scan is updated to 0.84
 			$samplerate *= 2;
 		}
@@ -701,6 +712,185 @@ sub parseAACHeader {
 
 	# All done
 	$cb->( $track, undef, @{$pt} );
+}
+
+sub parseMp4Header {
+	my ( $http, $dataref, $track, $args, $url ) = @_;
+	return 1 unless defined $$dataref;
+	
+	# stitch new data to existing buf and init parser if needed
+	$args->{_scanbuf} .= $$dataref;
+	$args->{_need} ||= 8;
+	$args->{_offset} ||= 0;
+	
+	my $len = length($$dataref);
+	my $offset = $args->{_offset};
+	
+	while (length($args->{_scanbuf}) - $offset > $args->{_need}) {
+		$args->{_atom} = substr($args->{_scanbuf}, $offset+4, 4);
+		$args->{_need} = unpack('N', substr($args->{_scanbuf}, $offset, 4));
+		$args->{_offset} = $args->{"_$args->{_atom}_"} = $offset;
+		
+		# a bit of sanity check
+		if ($offset == 0 && $args->{_atom} ne 'ftyp') {
+			$log->warn("no header! this is supposed to be a mp4 track");
+			$args->{cb}->( $track, undef, @{$args->{pt} || []} );
+			return;
+		}
+		
+		$offset += $args->{_need};
+		main::DEBUGLOG && $log->is_debug && $log->debug("atom $args->{_atom} at $args->{_offset} of size $args->{_need}");
+		
+		# mdat reached = audio offset & size acquired
+		if ($args->{_atom} eq 'mdat') {
+			$track->audio_offset($args->{_mdat_} + 8);
+			$track->audio_size($args->{_need});
+			last;
+		}	
+	}
+	
+	return 1 unless $args->{_mdat_};
+
+	# now make sure we have acquired a full moov atom
+	if (!$args->{_moov_}) {
+		# no 'moov' found but EoF
+		if (!$len) {
+			$args->{cb}->( $track, undef, @{$args->{pt} || []} );
+			return 0;
+		}
+		
+		# already waiting for bottom 'moov', we need more
+		return 1 if $args->{_range};
+		
+		# top 'moov' not found, need to seek beyond 'mdat'
+		$http->disconnect;
+		my $http = Slim::Networking::Async::HTTP->new;
+		$args->{_range} = "bytes=$offset-";
+		$args->{_scanbuf} = substr($args->{_scanbuf}, 0, $args->{_offset});
+		delete $args->{_need};
+		
+		# re-calculate header all the time (i.e. can't go direct at all)
+		$track->dynamic_header(2);
+		
+		main::INFOLOG && $log->is_info && $log->debug("'mdat' reached before 'moov' at ", length($args->{_scanbuf}), " => seeking with $args->{_range}");
+	
+		$http->send_request( {
+			request     => HTTP::Request->new( GET => $url,  [ 'Range' => $args->{_range} ] ),
+			onStream  	=> \&parseMp4Header,
+			onError     => sub {
+			my ($self, $error) = @_;
+				$log->warn( "could not find MP4 header $error" );
+				$args->{cb}->( $track, undef, @{$args->{pt} || []} );
+			},
+			passthrough => [ $track, $args, $url ],			
+		} );
+	
+		return 0;
+	} elsif ($args->{_atom} eq 'moov' && $len) {
+		return 1;
+	}	
+	
+	# finally got it, add 'moov' size it if was last atom
+	$args->{_scanbuf} = substr($args->{_scanbuf}, 0, $args->{_offset} + ($args->{_atom} eq 'moov' ? $args->{_need} : 0));
+	
+	# put at least 16 bytes after mdat or it confuses audio::scan (and header creation)
+	my $fh = File::Temp->new();
+	$fh->write($args->{_scanbuf} . pack('N', $track->audio_size) . 'mdat' . ' ' x 16);
+	$fh->seek(0, 0);
+	my $info = Audio::Scan->scan_fh( mp4 => $fh )->{info};
+
+	my ($samplesize, $channels);
+	my $samplerate = $info->{samplerate};
+	my $duration = $info->{song_length_ms} / 1000;
+	my $bitrate = $info->{avg_bitrate};
+	
+	if ( my $item = $info->{tracks}->[0] ) {
+		my $format;
+		
+		$samplesize = $item->{bits_per_sample};
+		$channels = $item->{channels};
+
+		# If encoding is alac, the file is lossless
+		if ( $item->{encoding} && $item->{encoding} eq 'alac' ) {
+			$format = 'alc';	
+			# bitrate will be wrong b/c we only gave a header, not a real file
+			$bitrate = $duration ? $track->audio_size * 8 / $duration : 850_000;
+		} elsif ( $item->{encoding} && $item->{encoding} eq 'drms' ) {
+			$track->drm(1);
+		} 
+		
+		# Check for HD-AAC file, if the file has 2 tracks and AOTs of 2/37
+		if ( defined $item->{audio_object_type} && (my $item2 = $info->{tracks}->[1]) ) {
+			if ( $item->{audio_object_type} == 2 && $item2->{audio_object_type} == 37 ) {
+				$samplesize   = $item2->{bits_per_sample};
+				$format = 'sls';
+			}
+		}
+		
+		# set mp4 to adts processor if format is aac
+		if (!$format) {
+			$track->audio_process(\&mp4_to_adts);
+			$format = 'aac';
+		} 
+		
+		# change track attributes if format has been altered
+		if ($format) {
+			Slim::Schema->clearContentTypeCache( $track->url );
+			Slim::Music::Info::setContentType( $track->url, $format );
+			$track->content_type($format);
+		}	
+	} else	{
+		$log->warn("no playable track found");
+		$args->{cb}->( $track, undef, @{$args->{pt} || []} );
+		return;
+	}
+
+	$track->samplerate($samplerate);
+	$track->samplesize($samplesize);
+	$track->channels($channels);	
+	Slim::Music::Info::setBitrate( $track, $bitrate );
+	Slim::Music::Info::setDuration( $track, $duration );
+	
+	# use the audio block to stash the temp file handler
+	$track->header_stash($fh);
+	$track->dynamic_header(1) unless $track->dynamic_header;
+	$track->build_header( sub { 
+				my ($track, $time) = @_;
+				my $info;		
+				my $fh = $track->header_stash;
+				$fh->seek(0, 0);
+
+				if ($time || $track->dynamic_header == 2) {			
+					# Audio::Scan seekoffset is first audio frame after seek but from the *original* header (not stitched)
+					$info = Audio::Scan->find_frame_fh_return_info(mp4 => $fh, ($time * 1000) || 0);
+					delete $info->{seek_offset} unless $time;
+				} else {	
+					read $fh, my $block, -s $fh;
+					$info->{seek_header} = substr($block, 0, -16);
+				}		
+				
+				# need to set codec info for mp4 ==> adts 
+				if ($track->audio_process) {
+					$info->{stash} = set_mp4_codec(\$info->{seek_header}) if $track->audio_process == \&mp4_to_adts;
+					$info->{seek_header} = '';
+				}	
+				
+				return $info;
+			} );
+	
+	if ( main::DEBUGLOG && $log->is_debug ) {
+		$log->debug( sprintf( "mp4: %dHz, %dBits, %dch => bitrate: %dkbps (ofs:%d, len:%d, hdr:%d)",
+					$samplerate, $samplesize, $channels, int( $bitrate / 1000 ), 
+					$track->audio_offset, $track->audio_size, length $args->{_scanbuf}) );
+	}	
+printf( "TRACKS: %d mp4: %dHz, %dBits, %dch => bitrate: %dkbps (ofs:%d, len:%d, hdr:%d)\n",
+					scalar @{$info->{tracks}}, 
+					$samplerate, $samplesize, $channels, int( $bitrate / 1000 ), 
+					$track->audio_offset, $track->audio_size, length $args->{_scanbuf} );
+	
+	# All done
+	$args->{cb}->( $track, undef, @{$args->{pt} || []} );
+	return 0;
 }
 
 sub parseOggHeader {
@@ -727,7 +917,7 @@ sub parseOggHeader {
 		my $bitrate = 0.6 * $samplerate * $samplesize * $channels;
 		$track->samplerate($samplerate);
 		$track->samplesize($samplesize);
-		$track->channels($channels);	
+		$track->channels($channels);
 		Slim::Music::Info::setBitrate( $track->url, $bitrate );
 		if ( main::DEBUGLOG && $log->is_debug ) {
 			$log->debug( sprintf( "OggFlac: %dHz, %dBits, %dch => estimated bitrate: %dkbps",
@@ -762,12 +952,12 @@ sub parseWavHeader {
 	my $pt	   = $args->{pt} || [];
 
 	my $data = $http->response->content;
-	
+
 	# do minimum check
 	if (substr($data, 0, 4) ne 'RIFF') {
 		$cb->( $track, undef, @{$pt} );
 		return;
-	}	
+	}
 
 	# search for Wav headers within the data
 	my $samplerate = unpack('V', substr($data, 24, 4));
@@ -777,13 +967,33 @@ sub parseWavHeader {
 	$track->samplerate($samplerate);
 	$track->samplesize($samplesize);
 	$track->channels($channels);	
+	$track->block_alignment($channels * $samplesize / 8);
+	my $fmtsize = unpack('V', substr($data, 16, 4));
+	$track->audio_offset(3*4 + $fmtsize + 2*4 + 2*4);
+	$track->audio_size(unpack('V', substr($data, 3*4 + $fmtsize + 2*4 + 1*4, 4)));
 	Slim::Music::Info::setBitrate( $track->url, $bitrate );
+	
 	if ( main::DEBUGLOG && $log->is_debug ) {
-		$log->debug( sprintf( "Wav: %dHz, %dBits, %dch => bitrate: %dkbps",
-					      $samplerate, $samplesize, $channels, int( $bitrate / 1000 ) ) );
-	} 
+		$log->debug( sprintf( "wav: %dHz, %dBits, %dch => bitrate: %dkbps (ofs: %d, len: %d)",
+					$samplerate, $samplesize, $channels, int( $bitrate / 1000 ), 
+					$track->audio_offset, $track->audio_size ) );
+	}	
+	
+	# we have a dynamic header but can go direct when not seeking
+	$track->header_stash(substr($data, 0, $track->audio_offset));
+	$track->dynamic_header(1);
+	$track->build_header( sub {
+				my ($track, $time) = @_;
+				my $trim = int ($track->bitrate / 8 * $time);
+				$trim -= $trim % ($track->block_alignment || 1);
+				substr($track->header_stash, -4, 4, pack('V', $track->audio_size - $trim));
+				return { 
+					seek_header => $track->header_stash,
+					seek_offset => $trim ? $track->audio_offset + $trim : undef, 
+				};
+			} );
 
-	# All done
+	# all done
 	$cb->( $track, undef, @{$pt} );
 }
 
@@ -795,15 +1005,15 @@ sub parseAifHeader {
 	my $pt	   = $args->{pt} || [];
 
 	my $data = $http->response->content;
-		
+
 	# do minimum check
 	if (substr($data, 0, 4) ne 'FORM') {
 		$cb->( $track, undef, @{$pt} );
 		return;
-	}	
-		
+	}
+
 	my $offset = 12;
-	
+
 	while ($offset < length($data) - 22) {
 
 		if (substr($data, $offset, 4) eq 'COMM') {
@@ -814,22 +1024,47 @@ sub parseAifHeader {
 			my $exponent = (unpack('s>', substr($data, $offset+16, 2)) & 0x7fff) - 16383 - 31;
 			while ($exponent < 0) { $samplerate >>= 1; $exponent++; }
 			while ($exponent > 0) { $samplerate <<= 1; $exponent--; }
-			my $bitrate = $samplerate * $samplesize * $channels;			
+			my $bitrate = $samplerate * $samplesize * $channels;
 			$track->samplerate($samplerate);
 			$track->samplesize($samplesize);
-			$track->channels($channels);	
-			$track->endian(1);	
+			$track->channels($channels);
+			$track->endian(1);
+			$track->block_alignment($channels * $samplesize / 8);
 			Slim::Music::Info::setBitrate( $track->url, $bitrate );
-			if ( main::DEBUGLOG && $log->is_debug ) {
-				$log->debug( sprintf( "Aif: %dHz, %dBits, %dch => bitrate: %dkbps",
-						$samplerate, $samplesize, $channels, int( $bitrate / 1000 ) ) );
-			}	
-			last;
 		} 
 		
-		$offset += unpack('N', substr($data, $offset+4, 4)) + 8;
-	}
+		if (substr($data, $offset, 4) eq 'SSND') {
+			my $chunk_offset = unpack('N', substr($data, $offset+8, 4));
+			$track->audio_offset(4*4 + $chunk_offset + $offset);
+			$track->audio_size(unpack('N', substr($data, $offset+4, 4)));
+			if ( main::DEBUGLOG && $log->is_debug ) {
+				$log->debug( sprintf( "aif: %dHz, %dBits, %dch => bitrate: %dkbps (ofs: %d, len: %d)",
+						$track->samplerate, $track->samplesize, $track->channels, int( $track->bitrate / 1000 ), 
+						$track->audio_offset, $track->audio_size ) );
+			}	
+			last;
+		}
 
+		$offset += unpack('N', substr($data, $offset+4, 4)) + 2*4;
+	}
+	
+	# we have a dynamic header but can go direct when not seeking
+	$track->header_stash(substr($data, 0, $track->audio_offset));
+	$track->dynamic_header(1);
+	$track->build_header( sub {
+				my ($track, $time) = @_;
+				my $trim = int ($track->bitrate / 8 * $time);
+				$trim -= $trim % ($track->block_alignment || 1);
+				# trim 'FORM' and 'SSND' chunk sizes 
+				substr($track->header_stash, 4, 4, pack('N', $track->audio_size + $track->audio_offset - 2*4 - $trim));
+				substr($track->header_stash, -3*4, 4, pack('N', $track->audio_size + 2*4 - $trim));
+				return { 
+					seek_header => $track->header_stash,
+					seek_offset => $trim ? $track->audio_offset + $trim : undef, 
+				};
+			} );
+	
+	# all done
 	$cb->( $track, undef, @{$pt} );
 }
 
@@ -1097,6 +1332,124 @@ sub parsePlaylist {
 		$delay += 1;
 	}
 }
+
+sub set_mp4_codec {
+	my ($bufref) = @_;
+	my $pos;
+	my $codec;
+	my %atoms = ( 
+		stsd => 16,
+		mp4a => 36,
+		meta => 12,
+		moov => 8,
+		trak => 8,
+		mdia => 8,
+		minf => 8,
+		stbl => 8,
+		utda => 8,
+		ilst => 8,
+	);
+	
+	while ($pos < length $$bufref) {
+		my $len = unpack("N", substr($$bufref, $pos, 4));
+		my $type = substr($$bufref, $pos + 4, 4);
+		$pos += 8;
+	
+		last if $type eq 'mdat';
+	
+		if ($type eq 'esds') {
+			my $offset = 4;
+			last unless unpack("C", substr($$bufref, $pos + $offset++, 1)) == 0x03;
+			my $data = unpack("C", substr($$bufref, $pos + $offset, 1));
+			$offset += 3 if $data == 0x80 || $data == 0x81 || $data == 0xfe;
+			$offset += 4;
+			last unless unpack("C", substr($$bufref, $pos + $offset++, 1)) == 0x04;
+			$data = unpack("C", substr($$bufref, $pos + $offset, 1));
+			$offset += 3 if $data == 0x80 || $data == 0x81 || $data == 0xfe;
+			$offset += 14;
+			last unless unpack("C", substr($$bufref, $pos + $offset++, 1)) == 0x05;
+			$data = unpack("C", substr($$bufref, $pos + $offset, 1));
+			$offset += 3 if $data == 0x80 || $data == 0x81 || $data == 0xfe;
+			$offset++;
+			$data = unpack("N", substr($$bufref, $pos + $offset, 4));
+			$codec->{freq_index} = ($data >> 23) & 0x0f;
+			$codec->{object_type} = $data >> 27;
+			# Fix because Touch and Radio cannot handle ADTS header of AAC Main.
+			$codec->{object_type} = 2 if $codec->{object_type} == 5; 
+			$codec->{channel_config} = ($data >> 19) & 0x0f;
+			$pos += $len - 8;
+	} elsif ($type eq 'stsz') {
+			my $offset = 4;
+			$codec->{frame_size} = unpack("N", substr($$bufref, $pos + $offset, 4));
+			if (!$codec->{frame_size}) {
+				$offset += 4;
+				$codec->{frames}= [];
+				$codec->{entries} = unpack("N", substr($$bufref, $pos + $offset, 4));
+				$offset += 4;
+				$codec->{frames} = [ unpack("N[$codec->{entries}]", substr($$bufref, $pos + $offset)) ];
+				if ($codec->{entries} != scalar @{$codec->{frames}}) {
+					$log->warn("inconsistent stsz entries $codec->{entries} vs ", scalar @{$codec->{frames}});
+					$codec->{entries} = scalar @{$codec->{frames}}; 
+				}	
+			}
+			$pos += $len - 8;
+		} else {
+			$pos += ($atoms{$type} || $len) - 8;
+		}	
+	
+		last if $codec->{frame_size} || $codec->{entries} && $codec->{channel_config};
+	}	
+
+	return $codec;
+}	
+
+sub mp4_to_adts {
+	my ($codec, $dataref, $chunk_size, $offset) = @_;
+	my $consumed = 0;
+	my @ADTSHeader = (0xFF,0xF1,0,0,0,0,0xFC);
+	
+	$codec->{inbuf} .= substr($$dataref, $offset);
+	$$dataref = substr($$dataref, 0, $offset);
+		
+	while (1) {
+		my $frame_size = $codec->{frame_size} || $codec->{frames}->[$codec->{frame_index}];
+		last if $frame_size + $consumed > length($codec->{inbuf}) || length($$dataref) + $frame_size + 7 > $chunk_size;
+	
+		$ADTSHeader[2] = (((($codec->{object_type} & 0x3) - 1)  << 6)   + ($codec->{freq_index} << 2) + ($codec->{channel_config} >> 2));
+		$ADTSHeader[3] = ((($codec->{channel_config} & 0x3) << 6) + (($frame_size + 7) >> 11));
+		$ADTSHeader[4] = ( (($frame_size + 7) & 0x7ff) >> 3);
+		$ADTSHeader[5] = (((($frame_size + 7) & 7) << 5) + 0x1f) ;
+
+		$$dataref .= pack("CCCCCCC",@ADTSHeader) . substr($codec->{inbuf}, $consumed, $frame_size);
+		
+		$codec->{frame_index}++;		
+		$consumed += $frame_size;
+	}	
+	
+	$codec->{inbuf} = substr($codec->{inbuf}, $consumed);
+	return length $codec->{inbuf};
+}	
+	
+# AAAAAAAA AAAABCCD EEFFFFGH HHIJKLMM MMMMMMMM MMMOOOOO OOOOOOPP 
+#
+# Header consists of 7 bytes without CRC.
+#
+# Letter	Length (bits)	Description
+# A	12	syncword 0xFFF, all bits must be 1
+# B	1	MPEG Version: 0 for MPEG-4, 1 for MPEG-2
+# C	2	Layer: always 0
+# D	1	set to 1 as there is no CRC 
+# E	2	profile, the MPEG-4 Audio Object Type minus 1
+# F	4	MPEG-4 Sampling Frequency Index (15 is forbidden)
+# G	1	private bit, guaranteed never to be used by MPEG, set to 0 when encoding, ignore when decoding
+# H	3	MPEG-4 Channel Configuration (in the case of 0, the channel configuration is sent via an inband PCE)
+# I	1	originality, set to 0 when encoding, ignore when decoding
+# J	1	home, set to 0 when encoding, ignore when decoding
+# K	1	copyrighted id bit, the next bit of a centrally registered copyright identifier, set to 0 when encoding, ignore when decoding
+# L	1	copyright id start, signals that this frame's copyright id bit is the first bit of the copyright id, set to 0 when encoding, ignore when decoding
+# M	13	frame length, this value must include 7 bytes of header 
+# O	11	Buffer fullness
+# P	2	Number of AAC frames (RDBs) in ADTS frame minus 1, for maximum compatibility always use 1 AAC frame per ADTS frame
 
 1;
 

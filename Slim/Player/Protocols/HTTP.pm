@@ -52,6 +52,44 @@ sub new {
 	return $self;
 }
 
+sub request {
+	my $self = shift;
+	my $args  = shift;
+	my $song = $args->{'song'};
+	my $stash;
+
+	# header is optional even when proxied, but define it empty for requestString
+	if (!defined $song->track->dynamic_header || $song->stripHeader) {
+		$song->initialAudioBlock('');
+		return $self->SUPER::request($args);
+	}
+
+	# obtain initial audio block if missing and adjust seekdata then
+	if ($song->track->build_header && !defined $song->initialAudioBlock) {
+		my $info = $song->track->build_header->($song->track, $song->seekdata ? $song->seekdata->{'timeOffset'} : 0);
+		$song->initialAudioBlock($info->{'seek_header'});
+		$song->seekdata->{sourceStreamOffset} = $info->{seek_offset} if $info->{'seek_offset'};
+		$stash = $info->{'stash'};
+	}
+
+	# all set for opening the HTTP object
+	$self = $self->SUPER::request($args);
+	return unless $self;
+	
+	my $length = length($song->initialAudioBlock);
+	${*$self}{'initialAudioBlockRemaining'} = $length;
+	${*$self}{'initialAudioBlockRef'} = \($song->initialAudioBlock);
+	main::DEBUGLOG && $log->debug("Got initial audio block of size $length");	
+	
+	# dynamic headers need to be re-calculated every time 
+	$song->initialAudioBlock(undef) if $song->track->dynamic_header;
+	
+	${*$self}{'audio_process'} = $song->track->audio_process;
+	${*$self}{'audio_stash'} = $stash;
+
+	return $self;
+}
+
 sub isRemote { 1 }
 
 sub readMetaData {
@@ -286,9 +324,51 @@ sub canDirectStream {
 	return $url;
 }
 
+# TODO: what happens is this method is overloaded in a sub-class that does not call its parents method
+sub canDirectStreamSong {
+	my ( $class, $client, $song ) = @_;
+	
+	# can't go direct if we are synced or proxy is set by user
+	my $direct = $class->canDirectStream( $client, $song->streamUrl(), $class->getFormatForURL() );
+	return 0 unless $direct;
+	
+	# no header or stripHeader flag has precedence
+	return $direct if $song->stripHeader || !defined $song->track->dynamic_header;
+	
+	# with dynamic header 2, always go direct otherwise only when not seeking
+	if ($song->track->dynamic_header == 2 || $song->seekdata) {
+		main::INFOLOG && $directlog->info("Need to add header, cannot stream direct");
+		return 0;
+	}	
+			
+	return $direct;
+}
+
 sub sysread {
 	my $self = $_[0];
 	my $chunkSize = $_[2];
+	
+	# stitch header if any
+	if (my $length = ${*$self}{'initialAudioBlockRemaining'}) {
+		
+		my $chunkLength = $length;
+		my $chunkref;
+		
+		main::DEBUGLOG && $log->debug("getting initial audio block of size $length");
+		
+		if ($length > $chunkSize || $length < length(${${*$self}{'initialAudioBlockRef'}})) {
+			$chunkLength = $length > $chunkSize ? $chunkSize : $length;
+			my $chunk = substr(${${*$self}{'initialAudioBlockRef'}}, -$length, $chunkLength);
+			$chunkref = \$chunk;
+			${*$self}{'initialAudioBlockRemaining'} = ($length - $chunkLength);
+		} else {
+			${*$self}{'initialAudioBlockRemaining'} = 0;
+			$chunkref = ${*$self}{'initialAudioBlockRef'};
+		}
+	
+		$_[1] = $$chunkref;
+		return $chunkLength;
+	}
 
 	my $metaInterval = ${*$self}{'metaInterval'};
 	my $metaPointer  = ${*$self}{'metaPointer'};
@@ -301,7 +381,9 @@ sub sysread {
 		#$log->debug("Reduced chunksize to $chunkSize for metadata");
 	}
 
-	my $readLength = CORE::sysread($self, $_[1], $chunkSize, length($_[1] || ''));
+	# reduce reading if we are building up too much processed audio
+	my $readLength = CORE::sysread($self, $_[1], ${*$self}{'audio_bytes'} > $chunkSize ? $chunkSize / 2 : $chunkSize, length($_[1] || ''));
+	${*$self}{'audio_bytes'} = ${*$self}{'audio_process'}->(${*$self}{'audio_stash'}, \$_[1], $chunkSize) if ${*$self}{'audio_process'}; 
 
 	if ($metaInterval && $readLength) {
 
@@ -328,9 +410,11 @@ sub parseDirectHeaders {
 	my ( $self, $client, $url, @headers ) = @_;
 
 	my $isDebug = main::DEBUGLOG && $directlog->is_debug;
-
+	my $oggType;
+	
 	# May get a track object
 	if ( blessed($url) ) {
+		($oggType) = $url->content_type =~ /(ogf|ogg|ops)/;
 		$url = $url->url;
 	}
 
@@ -432,7 +516,7 @@ sub parseDirectHeaders {
 		$contentType = 'mp3';
 	}
 
-	return ($title, $bitrate, $metaint, $redir, $contentType, $length, $body);
+	return ($title, $bitrate, $metaint, $redir, $oggType || $contentType, $length, $body);
 }
 
 =head2 parseHeaders( @headers )
@@ -450,11 +534,11 @@ sub parseHeaders {
 	my $self    = shift;
 	my $url     = $self->url;
 	my $client  = $self->client;
-	my $isOgf   = Slim::Music::Info::contentType( $url ) eq 'ogf';
+
 
 	my ($title, $bitrate, $metaint, $redir, $contentType, $length, $body) = $self->parseDirectHeaders($client, $url, @_);
 
-	if ($contentType && !$isOgf) {
+	if ($contentType) {
 		if (($contentType =~ /text/i) && !($contentType =~ /text\/xml/i)) {
 			# webservers often lie about playlists.  This will
 			# make it guess from the suffix.  (unless text/xml)
@@ -483,7 +567,7 @@ sub parseHeaders {
 		}
 	}
 
-	if ($bitrate && !$isOgf) {
+	if ($bitrate) {
 		main::INFOLOG && $log->is_info &&
 				$log->info(sprintf("Bitrate for %s set to %d",
 					$self->infoUrl,
@@ -586,19 +670,26 @@ sub requestString {
 		$request .= $CRLF . "Authorization: Basic " . MIME::Base64::encode_base64($user . ":" . $password,'');
 	}
 
-	$client->songBytes(0) if $client;
 
 	# If seeking, add Range header
-	if ($client && $seekdata) {
-		$request .= $CRLF . 'Range: bytes=' . int( ($seekdata->{sourceStreamOffset} || 0) + ($seekdata->{restartOffset} || 0) ) . '-';
+	if ($client) {
+		my $song = $client->streamingSong;
+		$client->songBytes(0);
+		
+		my $first = $seekdata->{restartOffset} || int( $seekdata->{sourceStreamOffset} );
+		$first ||= $song->track->audio_offset if $song->stripHeader || defined $song->initialAudioBlock;
+		
+		if ($first) {
+			$request .= $CRLF . 'Range: bytes=' . ($first || 0) . '-' . ($song->track->audio_size || '');
 
-		if (defined $seekdata->{timeOffset}) {
-			# Fix progress bar
-			$client->playingSong()->startOffset($seekdata->{timeOffset});
-			$client->master()->remoteStreamStartTime( Time::HiRes::time() - $seekdata->{timeOffset} );
+			if (defined $seekdata->{timeOffset}) {
+				# Fix progress bar
+				$client->playingSong()->startOffset($seekdata->{timeOffset});
+				$client->master()->remoteStreamStartTime( Time::HiRes::time() - $seekdata->{timeOffset} );
+			}
+
+			$client->songBytes( $first - ($song->stripHeader ? $song->track->audio_offset : 0) );
 		}
-
-		$client->songBytes(int( $seekdata->{sourceStreamOffset} ));
 	}
 
 	# Send additional information if we're POSTing
@@ -696,7 +787,7 @@ sub getMetadataFor {
 	if ( my $currentTitle = Slim::Music::Info::getCurrentTitle( $client, $url ) ) {
 		my @dashes = $currentTitle =~ /( - )/g;
 		if ( scalar @dashes == 1 ) {
-			($artist, $title) = split / - /, $currentTitle;
+			($artist, $title) = split /\s+-\s+/, $currentTitle;
 		}
 
 		else {
@@ -791,7 +882,7 @@ sub canSeek {
 	my $bitrate = $song->bitrate();
 	my $seconds = $song->duration();
 
-	if ( !$bitrate || !$seconds || $song->streamformat =~ /(pcm|wav|aif)/ ) {
+	if ( !$bitrate || !$seconds ) {
 		#$log->debug( "bitrate: $bitrate, duration: $seconds" );
 		#$log->debug( "Unknown bitrate or duration, seek disabled" );
 		return 0;
@@ -831,9 +922,13 @@ sub getSeekData {
 	$bitrate /= 1000;
 
 	main::INFOLOG && $log->info( "Trying to seek $newtime seconds into $bitrate kbps" );
-
+	
+	my $offset = int (( ( $bitrate * 1000 ) / 8 ) * $newtime);
+	$offset -= $offset % ($song->track->block_alignment || 1);
+	
+	# this might be re-calculated by open() if direct streaming is disabled
 	return {
-		sourceStreamOffset   => ( ( $bitrate * 1000 ) / 8 ) * $newtime,
+		sourceStreamOffset   => $offset + $song->track->audio_offset,
 		timeOffset           => $newtime,
 	};
 }
@@ -842,8 +937,11 @@ sub getSeekDataByPosition {
 	my ($class, $client, $song, $bytesReceived) = @_;
 
 	my $seekdata = $song->seekdata() || {};
-
-	return {%$seekdata, restartOffset => $bytesReceived};
+		
+	my $position = int($seekdata->{'sourceStreamOffset'}) || 0;
+	$position ||= $song->track->audio_offset if defined $song->initialAudioBlock;
+		
+	return {%$seekdata, restartOffset => $position + $bytesReceived - $song->initialAudioBlock};
 }
 
 1;

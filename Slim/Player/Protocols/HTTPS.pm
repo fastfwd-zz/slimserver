@@ -67,6 +67,28 @@ sub canDirectStream {
 sub sysread {
 	my $self = $_[0];
 	my $chunkSize = $_[2];
+	
+	# stitch header if any
+	if (my $length = ${*$self}{'initialAudioBlockRemaining'}) {
+		
+		my $chunkLength = $length;
+		my $chunkref;
+		
+		main::DEBUGLOG && $log->debug("getting initial audio block of size $length");
+		
+		if ($length > $chunkSize || $length < length(${${*$self}{'initialAudioBlockRef'}})) {
+			$chunkLength = $length > $chunkSize ? $chunkSize : $length;
+			my $chunk = substr(${${*$self}{'initialAudioBlockRef'}}, -$length, $chunkLength);
+			$chunkref = \$chunk;
+			${*$self}{'initialAudioBlockRemaining'} = ($length - $chunkLength);
+		} else {
+			${*$self}{'initialAudioBlockRemaining'} = 0;
+			$chunkref = ${*$self}{'initialAudioBlockRef'};
+		}
+	
+		$_[1] = $$chunkref;
+		return $chunkLength;
+	}
 
 	my $metaInterval = ${*$self}{'metaInterval'};
 	my $metaPointer  = ${*$self}{'metaPointer'};
@@ -78,8 +100,10 @@ sub sysread {
 		# This is very verbose...
 		#$log->debug("Reduced chunksize to $chunkSize for metadata");
 	}
-
-	my $readLength = $self->SUPER::sysread($_[1], $chunkSize);
+	
+	# reduce reading if we are building up too much processed audio
+	my $readLength = $self->SUPER::sysread($_[1], ${*$self}{'audio_bytes'} > $chunkSize ? $chunkSize / 2 : $chunkSize);
+	${*$self}{'audio_bytes'} = ${*$self}{'audio_process'}->(${*$self}{'audio_stash'}, \$_[1], $chunkSize) if ${*$self}{'audio_process'}; 
 
 	if ($metaInterval && $readLength) {
 

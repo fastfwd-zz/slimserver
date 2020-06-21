@@ -63,6 +63,7 @@ my @_playlistCloneAttributes = qw(
 			startOffset streamLength
 			seekdata initialAudioBlock
 			_canSeek _canSeekError
+			stripHeader
 
 			_duration _bitrate _streambitrate _streamFormat
 			_transcoded directstream
@@ -444,11 +445,13 @@ sub open {
 			rateLimit => 0,
 		};
 	}
-
+	
+	# don't modify $song in getConverterCommand2 
+	$self->stripHeader($transcoder->{'stripHeader'});
+	
 	# TODO work this out for each player in the sync-group
 	my $directUrl;
-	# Make sure for direct mode that if transcode rule is identity, codec is _really_ supported (e.g. wav vs pcm)
-	if ($transcoder->{'command'} eq '-' && ($directUrl = $client->canDirectStream($url, $self)) && grep {$_ eq $format} Slim::Player::CapabilitiesHelper::supportedFormats($client)) {
+	if ($transcoder->{'command'} eq '-' && ($directUrl = $client->canDirectStream($url, $self))) {
 		main::INFOLOG && $log->info( "URL supports direct streaming [$url->$directUrl]" );
 		$self->directstream(1);
 		$self->streamUrl($directUrl);
