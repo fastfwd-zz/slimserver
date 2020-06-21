@@ -770,7 +770,7 @@ sub parseMp4Header {
 		delete $args->{_need};
 		
 		# re-calculate header all the time (i.e. can't go direct at all)
-		$track->dynamic_header(2);
+		$track->initial_block_type(2);
 		
 		main::INFOLOG && $log->is_info && $log->debug("'mdat' reached before 'moov' at ", length($args->{_scanbuf}), " => seeking with $args->{_range}");
 	
@@ -831,7 +831,7 @@ sub parseMp4Header {
 		# can't do direct there as we need to process audio all the time
 		if (!$format) {
 			$track->audio_process(\&mp4_to_adts);
-			$track->dynamic_header(2);
+			$track->initial_block_type(2);
 			$format = 'aac';
 		} 
 		
@@ -854,15 +854,15 @@ sub parseMp4Header {
 	Slim::Music::Info::setDuration( $track, $duration );
 	
 	# use the audio block to stash the temp file handler
-	$track->header_stash($fh);
-	$track->dynamic_header(1) unless $track->dynamic_header;
-	$track->build_header( sub { 
+	$track->initial_block($fh);
+	$track->initial_block_type(1) unless $track->initial_block_type;
+	$track->get_initial_block( sub { 
 				my ($track, $time) = @_;
 				my $info;		
-				my $fh = $track->header_stash;
+				my $fh = $track->initial_block;
 				$fh->seek(0, 0);
 
-				if ($time || $track->dynamic_header == 2) {			
+				if ($time || $track->initial_block_type == 2) {			
 					# Audio::Scan seekoffset is first audio frame after seek but from the *original* header (not stitched)
 					$info = Audio::Scan->find_frame_fh_return_info(mp4 => $fh, ($time * 1000) || 0);
 					delete $info->{seek_offset} unless $time;
@@ -982,15 +982,15 @@ sub parseWavHeader {
 	}	
 	
 	# we have a dynamic header but can go direct when not seeking
-	$track->header_stash(substr($data, 0, $track->audio_offset));
-	$track->dynamic_header(1);
-	$track->build_header( sub {
+	$track->initial_block(substr($data, 0, $track->audio_offset));
+	$track->initial_block_type(1);
+	$track->get_initial_block( sub {
 				my ($track, $time) = @_;
 				my $trim = int ($track->bitrate / 8 * $time);
 				$trim -= $trim % ($track->block_alignment || 1);
-				substr($track->header_stash, -4, 4, pack('V', $track->audio_size - $trim));
+				substr($track->initial_block, -4, 4, pack('V', $track->audio_size - $trim));
 				return { 
-					seek_header => $track->header_stash,
+					seek_header => $track->initial_block,
 					seek_offset => $trim ? $track->audio_offset + $trim : undef, 
 				};
 			} );
@@ -1051,17 +1051,17 @@ sub parseAifHeader {
 	}
 	
 	# we have a dynamic header but can go direct when not seeking
-	$track->header_stash(substr($data, 0, $track->audio_offset));
-	$track->dynamic_header(1);
-	$track->build_header( sub {
+	$track->initial_block(substr($data, 0, $track->audio_offset));
+	$track->initial_block_type(1);
+	$track->get_initial_block( sub {
 				my ($track, $time) = @_;
 				my $trim = int ($track->bitrate / 8 * $time);
 				$trim -= $trim % ($track->block_alignment || 1);
 				# trim 'FORM' and 'SSND' chunk sizes 
-				substr($track->header_stash, 4, 4, pack('N', $track->audio_size + $track->audio_offset - 2*4 - $trim));
-				substr($track->header_stash, -3*4, 4, pack('N', $track->audio_size + 2*4 - $trim));
+				substr($track->initial_block, 4, 4, pack('N', $track->audio_size + $track->audio_offset - 2*4 - $trim));
+				substr($track->initial_block, -3*4, 4, pack('N', $track->audio_size + 2*4 - $trim));
 				return { 
-					seek_header => $track->header_stash,
+					seek_header => $track->initial_block,
 					seek_offset => $trim ? $track->audio_offset + $trim : undef, 
 				};
 			} );

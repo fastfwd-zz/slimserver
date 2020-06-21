@@ -59,14 +59,14 @@ sub request {
 	my $stash;
 
 	# header is optional even when proxied, but define it empty for requestString
-	if (!defined $song->track->dynamic_header || $song->stripHeader) {
+	if (!defined $song->track->initial_block_type || $song->stripHeader) {
 		$song->initialAudioBlock('');
 		return $self->SUPER::request($args);
 	}
 
 	# obtain initial audio block if missing and adjust seekdata then
-	if ($song->track->build_header && !defined $song->initialAudioBlock) {
-		my $info = $song->track->build_header->($song->track, $song->seekdata ? $song->seekdata->{'timeOffset'} : 0);
+	if ($song->track->get_initial_block && !defined $song->initialAudioBlock) {
+		my $info = $song->track->get_initial_block->($song->track, $song->seekdata ? $song->seekdata->{'timeOffset'} : 0);
 		$song->initialAudioBlock($info->{'seek_header'});
 		$song->seekdata->{sourceStreamOffset} = $info->{seek_offset} if $info->{'seek_offset'};
 		$stash = $info->{'stash'};
@@ -82,7 +82,7 @@ sub request {
 	main::DEBUGLOG && $log->debug("Got initial audio block of size $length");	
 	
 	# dynamic headers need to be re-calculated every time 
-	$song->initialAudioBlock(undef) if $song->track->dynamic_header;
+	$song->initialAudioBlock(undef) if $song->track->initial_block_type;
 	
 	${*$self}{'audio_process'} = $song->track->audio_process;
 	${*$self}{'audio_stash'} = $stash;
@@ -333,10 +333,10 @@ sub canDirectStreamSong {
 	return 0 unless $direct;
 	
 	# no header or stripHeader flag has precedence
-	return $direct if $song->stripHeader || !defined $song->track->dynamic_header;
+	return $direct if $song->stripHeader || !defined $song->track->initial_block_type;
 	
 	# with dynamic header 2, always go direct otherwise only when not seeking
-	if ($song->track->dynamic_header == 2 || $song->seekdata) {
+	if ($song->track->initial_block_type == 2 || $song->seekdata) {
 		main::INFOLOG && $directlog->info("Need to add header, cannot stream direct");
 		return 0;
 	}	
@@ -935,7 +935,7 @@ sub getSeekData {
 	my $offset = int (( ( $bitrate * 1000 ) / 8 ) * $newtime);
 	$offset -= $offset % ($song->track->block_alignment || 1);
 	
-	# this might be re-calculated by open() if direct streaming is disabled
+	# this might be re-calculated by request() if direct streaming is disabled
 	return {
 		sourceStreamOffset   => $offset + $song->track->audio_offset,
 		timeOffset           => $newtime,
