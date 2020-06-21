@@ -101,9 +101,18 @@ sub sysread {
 		#$log->debug("Reduced chunksize to $chunkSize for metadata");
 	}
 	
-	# reduce reading if we are building up too much processed audio
-	my $readLength = $self->SUPER::sysread($_[1], ${*$self}{'audio_bytes'} > $chunkSize ? $chunkSize / 2 : $chunkSize);
-	${*$self}{'audio_bytes'} = ${*$self}{'audio_process'}->(${*$self}{'audio_stash'}, \$_[1], $chunkSize) if ${*$self}{'audio_process'}; 
+	my $readLength;
+	
+	# do not sysread if we are building-up too much processed audio
+	if (${*$self}{'audio_buildup'} > $chunkSize) {
+		${*$self}{'audio_buildup'} = ${*$self}{'audio_process'}->(${*$self}{'audio_stash'}, \$_[1], $chunkSize); 
+	} else {	
+		$readLength = $self->SUPER::sysread($_[1], $chunkSize);
+		${*$self}{'audio_buildup'} = ${*$self}{'audio_process'}->(${*$self}{'audio_stash'}, \$_[1], $chunkSize) if ${*$self}{'audio_process'}; 
+	}	
+	
+	# when not-empty, chose return buffer length over sysread() 
+	$readLength = length $_[1] if length $_[1];
 
 	if ($metaInterval && $readLength) {
 

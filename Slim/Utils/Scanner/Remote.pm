@@ -1422,7 +1422,7 @@ sub mp4_to_adts {
 		$ADTSHeader[4] = ( (($frame_size + 7) & 0x7ff) >> 3);
 		$ADTSHeader[5] = (((($frame_size + 7) & 7) << 5) + 0x1f) ;
 
-		$$dataref .= pack("CCCCCCC",@ADTSHeader) . substr($codec->{inbuf}, $consumed, $frame_size);
+		$$dataref .= pack("CCCCCCC", @ADTSHeader) . substr($codec->{inbuf}, $consumed, $frame_size);
 		
 		$codec->{frame_index}++;		
 		$consumed += $frame_size;
