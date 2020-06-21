@@ -827,9 +827,11 @@ sub parseMp4Header {
 			}
 		}
 		
-		# set mp4 to adts processor if format is aac
+		# set mp4 to adts processor unless we are doing alac/sls
+		# can't do direct there as we need to process audio all the time
 		if (!$format) {
 			$track->audio_process(\&mp4_to_adts);
+			$track->dynamic_header(2);
 			$format = 'aac';
 		} 
 		
