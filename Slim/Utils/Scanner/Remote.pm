@@ -755,6 +755,7 @@ sub parseMp4Header {
 	if (!$args->{_moov_}) {
 		# no 'moov' found but EoF
 		if (!$len) {
+			$log->warn("no 'moov' found before EOF => track probably not playable");
 			$args->{cb}->( $track, undef, @{$args->{pt} || []} );
 			return 0;
 		}
@@ -827,13 +828,16 @@ sub parseMp4Header {
 			}
 		}
 		
+#=comment out these lines if you don't want ADTS frame extraction in Perl
 		# set mp4 to adts processor unless we are doing alac/sls
 		# can't do direct there as we need to process audio all the time
 		if (!$format) {
-			$track->audio_process(\&mp4_to_adts);
+			require Slim::Formats::Movie;
+			$track->audio_process(\&Slim::Formats::Movie::extractADTS);
 			$track->initial_block_type(2);
 			$format = 'aac';
 		} 
+#=cut		
 		
 		# change track attributes if format has been altered
 		if ($format) {
@@ -856,29 +860,8 @@ sub parseMp4Header {
 	# use the audio block to stash the temp file handler
 	$track->initial_block($fh);
 	$track->initial_block_type(1) unless $track->initial_block_type;
-	$track->get_initial_block( sub { 
-				my ($track, $time) = @_;
-				my $info;		
-				my $fh = $track->initial_block;
-				$fh->seek(0, 0);
-
-				if ($time || $track->initial_block_type == 2) {			
-					# Audio::Scan seekoffset is first audio frame after seek but from the *original* header (not stitched)
-					$info = Audio::Scan->find_frame_fh_return_info(mp4 => $fh, ($time * 1000) || 0);
-					delete $info->{seek_offset} unless $time;
-				} else {	
-					read $fh, my $block, -s $fh;
-					$info->{seek_header} = substr($block, 0, -16);
-				}		
-				
-				# need to set codec info for mp4 ==> adts 
-				if ($track->audio_process) {
-					$info->{stash} = set_mp4_codec(\$info->{seek_header}) if $track->audio_process == \&mp4_to_adts;
-					$info->{seek_header} = '';
-				}	
-				
-				return $info;
-			} );
+	require Slim::Formats::Movie;
+	$track->get_initial_block(\&Slim::Formats::Movie::getRemoteInitialBlock); 
 	
 	if ( main::DEBUGLOG && $log->is_debug ) {
 		$log->debug( sprintf( "mp4: %dHz, %dBits, %dch => bitrate: %dkbps (ofs:%d, len:%d, hdr:%d)",
@@ -984,16 +967,8 @@ sub parseWavHeader {
 	# we have a dynamic header but can go direct when not seeking
 	$track->initial_block(substr($data, 0, $track->audio_offset));
 	$track->initial_block_type(1);
-	$track->get_initial_block( sub {
-				my ($track, $time) = @_;
-				my $trim = int ($track->bitrate / 8 * $time);
-				$trim -= $trim % ($track->block_alignment || 1);
-				substr($track->initial_block, -4, 4, pack('V', $track->audio_size - $trim));
-				return { 
-					seek_header => $track->initial_block,
-					seek_offset => $trim ? $track->audio_offset + $trim : undef, 
-				};
-			} );
+	require Slim::Formats::Wav;
+	$track->get_initial_block(\&Slim::Formats::Wav::getRemoteInitialBlock);
 
 	# all done
 	$cb->( $track, undef, @{$pt} );
@@ -1053,19 +1028,9 @@ sub parseAifHeader {
 	# we have a dynamic header but can go direct when not seeking
 	$track->initial_block(substr($data, 0, $track->audio_offset));
 	$track->initial_block_type(1);
-	$track->get_initial_block( sub {
-				my ($track, $time) = @_;
-				my $trim = int ($track->bitrate / 8 * $time);
-				$trim -= $trim % ($track->block_alignment || 1);
-				# trim 'FORM' and 'SSND' chunk sizes 
-				substr($track->initial_block, 4, 4, pack('N', $track->audio_size + $track->audio_offset - 2*4 - $trim));
-				substr($track->initial_block, -3*4, 4, pack('N', $track->audio_size + 2*4 - $trim));
-				return { 
-					seek_header => $track->initial_block,
-					seek_offset => $trim ? $track->audio_offset + $trim : undef, 
-				};
-			} );
-	
+	require Slim::Formats::AIFF;
+	$track->get_initial_block(\&Slim::Formats::AIFF::getRemoteInitialBlock);
+		
 	# all done
 	$cb->( $track, undef, @{$pt} );
 }
@@ -1334,124 +1299,6 @@ sub parsePlaylist {
 		$delay += 1;
 	}
 }
-
-sub set_mp4_codec {
-	my ($bufref) = @_;
-	my $pos;
-	my $codec;
-	my %atoms = ( 
-		stsd => 16,
-		mp4a => 36,
-		meta => 12,
-		moov => 8,
-		trak => 8,
-		mdia => 8,
-		minf => 8,
-		stbl => 8,
-		utda => 8,
-		ilst => 8,
-	);
-	
-	while ($pos < length $$bufref) {
-		my $len = unpack("N", substr($$bufref, $pos, 4));
-		my $type = substr($$bufref, $pos + 4, 4);
-		$pos += 8;
-	
-		last if $type eq 'mdat';
-	
-		if ($type eq 'esds') {
-			my $offset = 4;
-			last unless unpack("C", substr($$bufref, $pos + $offset++, 1)) == 0x03;
-			my $data = unpack("C", substr($$bufref, $pos + $offset, 1));
-			$offset += 3 if $data == 0x80 || $data == 0x81 || $data == 0xfe;
-			$offset += 4;
-			last unless unpack("C", substr($$bufref, $pos + $offset++, 1)) == 0x04;
-			$data = unpack("C", substr($$bufref, $pos + $offset, 1));
-			$offset += 3 if $data == 0x80 || $data == 0x81 || $data == 0xfe;
-			$offset += 14;
-			last unless unpack("C", substr($$bufref, $pos + $offset++, 1)) == 0x05;
-			$data = unpack("C", substr($$bufref, $pos + $offset, 1));
-			$offset += 3 if $data == 0x80 || $data == 0x81 || $data == 0xfe;
-			$offset++;
-			$data = unpack("N", substr($$bufref, $pos + $offset, 4));
-			$codec->{freq_index} = ($data >> 23) & 0x0f;
-			$codec->{object_type} = $data >> 27;
-			# Fix because Touch and Radio cannot handle ADTS header of AAC Main.
-			$codec->{object_type} = 2 if $codec->{object_type} == 5; 
-			$codec->{channel_config} = ($data >> 19) & 0x0f;
-			$pos += $len - 8;
-	} elsif ($type eq 'stsz') {
-			my $offset = 4;
-			$codec->{frame_size} = unpack("N", substr($$bufref, $pos + $offset, 4));
-			if (!$codec->{frame_size}) {
-				$offset += 4;
-				$codec->{frames}= [];
-				$codec->{entries} = unpack("N", substr($$bufref, $pos + $offset, 4));
-				$offset += 4;
-				$codec->{frames} = [ unpack("N[$codec->{entries}]", substr($$bufref, $pos + $offset)) ];
-				if ($codec->{entries} != scalar @{$codec->{frames}}) {
-					$log->warn("inconsistent stsz entries $codec->{entries} vs ", scalar @{$codec->{frames}});
-					$codec->{entries} = scalar @{$codec->{frames}}; 
-				}	
-			}
-			$pos += $len - 8;
-		} else {
-			$pos += ($atoms{$type} || $len) - 8;
-		}	
-	
-		last if $codec->{frame_size} || $codec->{entries} && $codec->{channel_config};
-	}	
-
-	return $codec;
-}	
-
-sub mp4_to_adts {
-	my ($codec, $dataref, $chunk_size, $offset) = @_;
-	my $consumed = 0;
-	my @ADTSHeader = (0xFF,0xF1,0,0,0,0,0xFC);
-	
-	$codec->{inbuf} .= substr($$dataref, $offset);
-	$$dataref = substr($$dataref, 0, $offset);
-		
-	while (1) {
-		my $frame_size = $codec->{frame_size} || $codec->{frames}->[$codec->{frame_index}];
-		last if $frame_size + $consumed > length($codec->{inbuf}) || length($$dataref) + $frame_size + 7 > $chunk_size;
-	
-		$ADTSHeader[2] = (((($codec->{object_type} & 0x3) - 1)  << 6)   + ($codec->{freq_index} << 2) + ($codec->{channel_config} >> 2));
-		$ADTSHeader[3] = ((($codec->{channel_config} & 0x3) << 6) + (($frame_size + 7) >> 11));
-		$ADTSHeader[4] = ( (($frame_size + 7) & 0x7ff) >> 3);
-		$ADTSHeader[5] = (((($frame_size + 7) & 7) << 5) + 0x1f) ;
-
-		$$dataref .= pack("CCCCCCC", @ADTSHeader) . substr($codec->{inbuf}, $consumed, $frame_size);
-		
-		$codec->{frame_index}++;		
-		$consumed += $frame_size;
-	}	
-	
-	$codec->{inbuf} = substr($codec->{inbuf}, $consumed);
-	return length $codec->{inbuf};
-}	
-	
-# AAAAAAAA AAAABCCD EEFFFFGH HHIJKLMM MMMMMMMM MMMOOOOO OOOOOOPP 
-#
-# Header consists of 7 bytes without CRC.
-#
-# Letter	Length (bits)	Description
-# A	12	syncword 0xFFF, all bits must be 1
-# B	1	MPEG Version: 0 for MPEG-4, 1 for MPEG-2
-# C	2	Layer: always 0
-# D	1	set to 1 as there is no CRC 
-# E	2	profile, the MPEG-4 Audio Object Type minus 1
-# F	4	MPEG-4 Sampling Frequency Index (15 is forbidden)
-# G	1	private bit, guaranteed never to be used by MPEG, set to 0 when encoding, ignore when decoding
-# H	3	MPEG-4 Channel Configuration (in the case of 0, the channel configuration is sent via an inband PCE)
-# I	1	originality, set to 0 when encoding, ignore when decoding
-# J	1	home, set to 0 when encoding, ignore when decoding
-# K	1	copyrighted id bit, the next bit of a centrally registered copyright identifier, set to 0 when encoding, ignore when decoding
-# L	1	copyright id start, signals that this frame's copyright id bit is the first bit of the copyright id, set to 0 when encoding, ignore when decoding
-# M	13	frame length, this value must include 7 bytes of header 
-# O	11	Buffer fullness
-# P	2	Number of AAC frames (RDBs) in ADTS frame minus 1, for maximum compatibility always use 1 AAC frame per ADTS frame
 
 1;
 
