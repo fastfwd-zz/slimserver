@@ -716,7 +716,7 @@ sub parseAACHeader {
 
 sub parseMp4Header {
 	my ( $http, $dataref, $track, $args, $url ) = @_;
-	return 1 unless defined $$dataref;
+	return -1 unless defined $$dataref;
 	
 	# stitch new data to existing buf and init parser if needed
 	$args->{_scanbuf} .= $$dataref;
@@ -749,7 +749,7 @@ sub parseMp4Header {
 		}	
 	}
 	
-	return 1 unless $args->{_mdat_};
+	return -1 unless $args->{_mdat_};
 
 	# now make sure we have acquired a full moov atom
 	if (!$args->{_moov_}) {
@@ -761,11 +761,10 @@ sub parseMp4Header {
 		}
 		
 		# already waiting for bottom 'moov', we need more
-		return 1 if $args->{_range};
+		return -1 if $args->{_range};
 		
 		# top 'moov' not found, need to seek beyond 'mdat'
-		$http->disconnect;
-		my $http = Slim::Networking::Async::HTTP->new;
+		my $query = Slim::Networking::Async::HTTP->new;
 		$args->{_range} = "bytes=$offset-";
 		$args->{_scanbuf} = substr($args->{_scanbuf}, 0, $args->{_offset});
 		delete $args->{_need};
@@ -773,9 +772,13 @@ sub parseMp4Header {
 		# re-calculate header all the time (i.e. can't go direct at all)
 		$track->initial_block_type(2);
 		
+		# can't re-issue an HTTP request, ask caller to continue at $offset then
+		return $offset unless $http;
+		$http->disconnect;
+		
 		main::INFOLOG && $log->is_info && $log->debug("'mdat' reached before 'moov' at ", length($args->{_scanbuf}), " => seeking with $args->{_range}");
 	
-		$http->send_request( {
+		$query->send_request( {
 			request     => HTTP::Request->new( GET => $url,  [ 'Range' => $args->{_range} ] ),
 			onStream  	=> \&parseMp4Header,
 			onError     => sub {
@@ -788,7 +791,7 @@ sub parseMp4Header {
 	
 		return 0;
 	} elsif ($args->{_atom} eq 'moov' && $len) {
-		return 1;
+		return -1;
 	}	
 	
 	# finally got it, add 'moov' size it if was last atom

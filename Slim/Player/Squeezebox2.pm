@@ -646,7 +646,7 @@ sub directHeaders {
 				$client->sendFrame('body', \(pack('N', $length)));
 
 			} elsif ($client->contentTypeSupported($controller->song->streamformat)) {
-				
+
 				# If we redirected (Live365), update the original URL with the metadata from the real URL
 				if ( my $oldURL = delete $redirects->{ $url } ) {
 

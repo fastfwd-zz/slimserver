@@ -396,9 +396,7 @@ sub sysread {
 		${*$self}{'audio_buildup'} = ${*$self}{'audio_process'}->(${*$self}{'audio_stash'}, \$_[1], $chunkSize) if ${*$self}{'audio_process'}; 
 	}	
 	
-	# when not-empty, chose return buffer length over sysread() 
-	$readLength = length $_[1] if length $_[1];
-	
+	# use $readLength from socket for meta interval adjustement
 	if ($metaInterval && $readLength) {
 
 		$metaPointer += $readLength;
@@ -416,6 +414,9 @@ sub sysread {
 			main::DEBUGLOG && $log->debug("The shoutcast metadata overshot the interval.");
 		}
 	}
+	
+	# when not-empty, chose return buffer length over sysread() 
+	$readLength = length $_[1] if length $_[1];
 
 	return $readLength;
 }
