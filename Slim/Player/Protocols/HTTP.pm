@@ -65,11 +65,16 @@ sub request {
 	}
 
 	# obtain initial audio block if missing and adjust seekdata then
-	if ($song->track->get_initial_block && !defined $song->initialAudioBlock) {
-		my $info = $song->track->get_initial_block->($song->track, $song->seekdata ? $song->seekdata->{'timeOffset'} : 0);
-		$song->initialAudioBlock($info->{'seek_header'});
-		$song->seekdata->{sourceStreamOffset} = $info->{seek_offset} if $info->{'seek_offset'};
-		$stash = $info->{'stash'};
+	if (!defined $song->initialAudioBlock) {
+		if ($song->track->get_initial_block) {
+			my $info = $song->track->get_initial_block->($song->track, $song->seekdata ? $song->seekdata->{'timeOffset'} : 0);
+			$song->initialAudioBlock($info->{'seek_header'});
+			$song->seekdata->{sourceStreamOffset} = $info->{seek_offset} if $info->{'seek_offset'};
+			$stash = $info->{'stash'};
+		} else {
+			# no callback to define initial block, means it's empty BUT defined
+			$song->initialAudioBlock('');
+		}	
 	}
 
 	# all set for opening the HTTP object
@@ -336,7 +341,7 @@ sub canDirectStreamSong {
 	return $direct if $song->stripHeader || !defined $song->track->initial_block_type;
 	
 	# with dynamic header 2, always go direct otherwise only when not seeking
-	if ($song->track->initial_block_type == 2 || $song->seekdata) {
+	if ($song->track->initial_block_type == 2 || $song->seekdata || $song->track->audio_process) {
 		main::INFOLOG && $directlog->info("Need to add header, cannot stream direct");
 		return 0;
 	}	
