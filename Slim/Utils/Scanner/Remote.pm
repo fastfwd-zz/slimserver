@@ -725,8 +725,9 @@ sub parseMp4Header {
 	
 	my $len = length($$dataref);
 	my $offset = $args->{_offset};
+	my $cb	   = $args->{cb} || sub {};	
 	
-	while (length($args->{_scanbuf}) - $offset > $args->{_need}) {
+	while (length($args->{_scanbuf}) > $args->{_offset} + $args->{_need} + 8) {
 		$args->{_atom} = substr($args->{_scanbuf}, $offset+4, 4);
 		$args->{_need} = unpack('N', substr($args->{_scanbuf}, $offset, 4));
 		$args->{_offset} = $args->{"_$args->{_atom}_"} = $offset;
@@ -734,8 +735,8 @@ sub parseMp4Header {
 		# a bit of sanity check
 		if ($offset == 0 && $args->{_atom} ne 'ftyp') {
 			$log->warn("no header! this is supposed to be a mp4 track");
-			$args->{cb}->( $track, undef, @{$args->{pt} || []} );
-			return;
+			$cb->( $track, undef, @{$args->{pt} || []} );
+			return 0;
 		}
 		
 		$offset += $args->{_need};
@@ -756,7 +757,7 @@ sub parseMp4Header {
 		# no 'moov' found but EoF
 		if (!$len) {
 			$log->warn("no 'moov' found before EOF => track probably not playable");
-			$args->{cb}->( $track, undef, @{$args->{pt} || []} );
+			$cb->( $track, undef, @{$args->{pt} || []} );
 			return 0;
 		}
 		
@@ -784,7 +785,7 @@ sub parseMp4Header {
 			onError     => sub {
 			my ($self, $error) = @_;
 				$log->warn( "could not find MP4 header $error" );
-				$args->{cb}->( $track, undef, @{$args->{pt} || []} );
+				$cb->( $track, undef, @{$args->{pt} || []} );
 			},
 			passthrough => [ $track, $args, $url ],			
 		} );
@@ -850,8 +851,8 @@ sub parseMp4Header {
 		}	
 	} else	{
 		$log->warn("no playable track found");
-		$args->{cb}->( $track, undef, @{$args->{pt} || []} );
-		return;
+		$cb->( $track, undef, @{$args->{pt} || []} );
+		return 0;
 	}
 
 	$track->samplerate($samplerate);
@@ -877,7 +878,7 @@ printf( "TRACKS: %d mp4: %dHz, %dBits, %dch => bitrate: %dkbps (ofs:%d, len:%d, 
 					$track->audio_offset, $track->audio_size, length $args->{_scanbuf} );
 	
 	# All done
-	$args->{cb}->( $track, undef, @{$args->{pt} || []} );
+	$cb->( $track, undef, @{$args->{pt} || []} );
 	return 0;
 }
 
