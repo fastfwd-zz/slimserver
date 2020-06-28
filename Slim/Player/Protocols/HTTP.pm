@@ -519,7 +519,6 @@ sub setLiveHeader {
 	return 0 unless Slim::Formats->loadTagFormatForType($type) && 
                     ($formatClass = Slim::Formats->classForFormat($type)) &&
                     $formatClass->can('parseStream');
-print("SETLIVE HEADER $type $formats\n");					
 					
 	${*$self}{'parser'} = $formatClass->can('parseStream');
 	${*$self}{'parser_args'} = { formats => $formats };
@@ -654,7 +653,6 @@ sub parseHeaders {
 	my $url     = $self->url;
 	my $client  = $self->client;
 
-
 	my ($title, $bitrate, $metaint, $redir, $contentType, $length, $body) = $self->parseDirectHeaders($client, $url, @_);
 
 	if ($contentType) {
@@ -788,7 +786,6 @@ sub requestString {
 	if (defined($user) && defined($password)) {
 		$request .= $CRLF . "Authorization: Basic " . MIME::Base64::encode_base64($user . ":" . $password,'');
 	}
-
 
 	# If seeking, add Range header
 	if ($client) {
