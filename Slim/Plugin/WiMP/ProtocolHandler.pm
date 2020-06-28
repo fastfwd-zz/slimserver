@@ -253,16 +253,6 @@ sub _gotTrack {
 	} else {
 		$params->{successCb}->();
 	}	
-
-
-	# trigger playback statistics update
-	if ( $info->{duration} > 2) {
-		# we're asked to report back if a track has been played halfway through
-		my $params = {
-			duration => $info->{duration} / 2,
-			url      => $params->{url},
-		};
-	}
 }
 
 sub _gotTrackError {
@@ -273,14 +263,6 @@ sub _gotTrackError {
 	return if $params->{song}->pluginData('abandonSong');
 
 	_handleClientError( $error, $client, $params );
-}
-
-sub canDirectStreamSong {
-	my ( $class, $client, $song ) = @_;
-
-	# We need to check with the base class (HTTP) to see if we
-	# are synced or if the user has set mp3StreamingMethod
-	return $class->SUPER::canDirectStreamSong( $client, $song );
 }
 
 # parseHeaders is used for proxied streaming
