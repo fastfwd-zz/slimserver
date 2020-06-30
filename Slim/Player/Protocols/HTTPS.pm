@@ -75,10 +75,20 @@ sub canDirectStreamSong {
 	return 0;
 }
 
+# see http://modernperlbooks.com/mt/2009/09/when-super-isnt.html
+sub _sysread {
+	my $readLength = $_[0]->SUPER::sysread($_[1], $_[2], $_[3]); 
+	
+	if (main::ISWINDOWS && !$readLength) {
+		$! = EWOULDBLOCK;
+	}
+
+	return $readLength;
+}
+
+# we need to subclass sysread as HTTPS first inherits from IO::Socket::SSL  
 sub sysread {
-	my $readLength = Slim::Player::Protocols::HTTP::_sysread( sub { 
-	                            return $_[0]->SUPER::sysread($_[1], $_[2], $_[3]); 
-	                        }, @_);
+	my $readLength = Slim::Player::Protocols::HTTP::sysread(@_);
 
 	if (main::ISWINDOWS && !$readLength) {
 		$! = EWOULDBLOCK;
