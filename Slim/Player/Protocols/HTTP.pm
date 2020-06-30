@@ -75,8 +75,7 @@ sub request {
 		}
 		
 		if ($formatClass->can('getInitialAudioBlock')) {
-			my $initialBlock = \$formatClass->getInitialAudioBlock($track->initial_block_fh, $track, $seekdata->{timeOffset} || 0);
-			$song->initialAudioBlock($$initialBlock);
+			$song->initialAudioBlock($formatClass->getInitialAudioBlock($track->initial_block_fh, $track, $seekdata->{timeOffset} || 0));
 		}	
 		
 		main::DEBUGLOG && $log->debug("building new header");	
@@ -364,8 +363,18 @@ sub canDirectStreamSong {
 }
 
 sub sysread {
+	my $readLength = _sysread( sub { 
+	                   return CORE::sysread($_[0], $_[1], $_[2], $_[3]); 
+                }, @_) ;
+	return $readLength;
+}
+
+sub _sysread {
+	my $sysread = shift;
 	my $self = $_[0];
 	my $chunkSize = $_[2];
+	
+	return $sysread->($self, $_[1], $chunkSize, length($_[1] || '')) if ${*$self}{'recurse'};
 	
 	# stitch header if any
 	if (my $length = ${*$self}{'initialAudioBlockRemaining'}) {
@@ -408,7 +417,7 @@ sub sysread {
 		${*$self}{'audio_buildup'} = ${*$self}{'audio_process'}->(${*$self}{'audio_stash'}, $_[1], $chunkSize); 
 	} 
 	else {	
-		$readLength = CORE::sysread($self, $_[1], $chunkSize, length($_[1] || ''));
+		$readLength = $sysread->($self, $_[1], $chunkSize, length($_[1] || ''));
 		$readLength = $self->_parseStreamHeader($_[1], $readLength, $chunkSize);
 		${*$self}{'audio_buildup'} = ${*$self}{'audio_process'}->(${*$self}{'audio_stash'}, $_[1], $chunkSize) if ${*$self}{'audio_process'}; 
 	}	
@@ -422,7 +431,9 @@ sub sysread {
 		# handle instream metadata for shoutcast/icecast
 		if ($metaPointer == $metaInterval) {
 
+			${*$self}{'recurse'} = 1;
 			$self->readMetaData();
+			${*$self}{'recurse'} = 0;
 
 			${*$self}{'metaPointer'} = 0;
 
